@@ -444,7 +444,13 @@ impl ContainerAspect for Name {
 }
 
 #[derive(Clone)]
+pub enum CurrentUserMode {
+    Builtin,
+}
+
+#[derive(Clone)]
 pub struct CurrentUser {
+    pub mode: CurrentUserMode,
     name: String,
     uid: String,
     group: String,
@@ -452,7 +458,7 @@ pub struct CurrentUser {
 }
 
 impl CurrentUser {
-    pub fn detect() -> Result<Self> {
+    pub fn detect(mode: CurrentUserMode) -> Result<Self> {
         let uid = users::get_current_uid();
         let gid = users::get_current_gid();
         let name = match users::get_user_by_uid(uid) {
@@ -464,6 +470,7 @@ impl CurrentUser {
             None => return Err(Error::MissingGroup(gid.to_string())),
         };
         Ok(CurrentUser {
+            mode: mode,
             name: name,
             uid: uid.to_string(),
             group: group,
