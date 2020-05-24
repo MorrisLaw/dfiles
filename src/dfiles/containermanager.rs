@@ -2,8 +2,10 @@ use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
+use std::process;
 
-use clap::{App, ArgMatches, SubCommand};
+use clap::{App, Arg, ArgMatches, SubCommand};
 use dockworker::{ContainerBuildOptions, Docker};
 use dyn_clone;
 use serde::Deserialize;
@@ -54,8 +56,19 @@ impl ContainerManager {
 
     fn run(&self, matches: &ArgMatches) -> Result<()> {
         let mut args: Vec<String> = vec!["--rm"].into_iter().map(String::from).collect();
+        let mut has_entrypoint = false;
 
         for aspect in &self.aspects {
+            if aspect.entrypoint_fns().len() > 0 && !has_entrypoint {
+                has_entrypoint = false;
+                let binary = std::env::current_exe()?;
+                args.extend(vec![
+                    String::from("-v"),
+                    format!("{}:{}", binary.to_string_lossy(), "/entrypoint"),
+                    String::from("--entrypoint"),
+                    String::from("/entrypoint"),
+                ]);
+            }
             println!("{:}", aspect);
             args.extend(aspect.run_args(Some(&matches))?);
         }
@@ -161,24 +174,59 @@ impl ContainerManager {
         Ok(())
     }
 
-    fn entrypoint(&self) -> Result<()> {
+    fn entrypoint(&self, matches: &ArgMatches) -> Result<()> {
         let sudo_path = which("sudo")?;
+        let mut sudo_args = Vec::new();
         for aspect in &self.aspects {
-            for ep_fn in aspect.entrypoint_fns() {
+            for ep_fn in &mut aspect.entrypoint_fns() {
                 println!("{:}: {}", aspect.name(), ep_fn.description);
+                sudo_args.append(&mut ep_fn.sudo_args);
                 (ep_fn.func)()?;
             }
         }
-        Ok(())
+
+        if let Some(args) = matches.values_of("command") {
+            println!("{:?}", args);
+            process::Command::new(sudo_path)
+                .args(sudo_args)
+                .arg("--")
+                .args(args)
+                .status()?;
+            Ok(())
+        } else {
+            Err(Error::MissingEntrypointArgs)
+        }
     }
 
     pub fn execute(&mut self) -> Result<()> {
+        let entrypoint_arg = Arg::with_name("command").multiple(true).required(true);
+
+        // note: since we want to use this binary as an entrypoint "script" in a docker container,
+        // it has to be callable without using subcommands so the first thing we do is check if
+        // that's how it was called and act accordingly
+        let entrypoint_cmd = App::new("entrypoint")
+            .about("entrypoint mode")
+            .arg(entrypoint_arg.clone());
+
+        let binary = std::env::current_exe()?;
+        println!("{:?}", binary);
+        if binary == PathBuf::from("/entrypoint") {
+            println!("wtf mate");
+            let matches = entrypoint_cmd.get_matches();
+            // note for tomorrow: probably need to skip over clap usage entirely to avoid clap
+            // attempting to claim options meant for the command being executed by docker
+            return self.entrypoint(&matches);
+        }
+
         let mut run = SubCommand::with_name("run").about("run app in container");
         let mut build = SubCommand::with_name("build").about("build app container");
         let mut config = SubCommand::with_name("config").about("configure app container settings");
-        let entrypoint = SubCommand::with_name("entrypoint").about("entrypoint mode");
         let generate_archive = SubCommand::with_name("generate-archive")
             .about("generate archive used to build container");
+
+        let entrypoint = SubCommand::with_name("entrypoint")
+            .about("entrypoint test mode")
+            .arg(entrypoint_arg);
 
         let mut app = App::new(&self.name).version("0.0");
 
@@ -226,7 +274,7 @@ impl ContainerManager {
             ("run", Some(subm)) => self.run(&subm),
             ("build", _) => self.build(),
             ("config", Some(subm)) => self.config(&subm),
-            ("entrypoint", _) => self.entrypoint(),
+            ("entrypoint", Some(subm)) => self.entrypoint(&subm),
             ("generate-archive", _) => self.generate_archive(),
             (_, _) => Ok(println!("{}", matches.usage())),
         }
