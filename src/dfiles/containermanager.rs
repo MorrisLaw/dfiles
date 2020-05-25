@@ -3,7 +3,6 @@ use std::convert::TryFrom;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process;
 
 use clap::{App, Arg, ArgMatches, SubCommand};
 use dockworker::{ContainerBuildOptions, Docker};
@@ -12,11 +11,11 @@ use serde::Deserialize;
 use serde_json::from_str;
 use tar::{Builder, Header};
 use tempfile::NamedTempFile;
-use which::which;
 
 use super::aspects;
 use super::config;
 use super::docker;
+use super::entrypoint;
 use super::error::{Error, Result};
 
 #[derive(Deserialize, Debug)]
@@ -56,21 +55,17 @@ impl ContainerManager {
 
     fn run(&self, matches: &ArgMatches) -> Result<()> {
         let mut args: Vec<String> = vec!["--rm"].into_iter().map(String::from).collect();
-        let mut has_entrypoint = false;
+        let mut ep = entrypoint::Entrypoint::empty();
 
         for aspect in &self.aspects {
-            if aspect.entrypoint_fns().len() > 0 && !has_entrypoint {
-                has_entrypoint = false;
-                let binary = std::env::current_exe()?;
-                args.extend(vec![
-                    String::from("-v"),
-                    format!("{}:{}", binary.to_string_lossy(), "/entrypoint"),
-                    String::from("--entrypoint"),
-                    String::from("/entrypoint"),
-                ]);
-            }
             println!("{:}", aspect);
             args.extend(aspect.run_args(Some(&matches))?);
+            ep.extend(aspect.entrypoint_scripts());
+        }
+
+        if !ep.is_empty() {
+            ep.prepare()?;
+            args.extend(ep.run_args()?);
         }
 
         args.push(self.image().to_string());
@@ -174,30 +169,6 @@ impl ContainerManager {
         Ok(())
     }
 
-    fn entrypoint(&self, args: Vec<String>) -> Result<()> {
-        let sudo_path = which("sudo")?;
-        let mut sudo_args = Vec::new();
-        for aspect in &self.aspects {
-            for ep_fn in &mut aspect.entrypoint_fns() {
-                println!("{:}: {}", aspect.name(), ep_fn.description);
-                sudo_args.append(&mut ep_fn.sudo_args);
-                (ep_fn.func)()?;
-            }
-        }
-
-        if args.len() < 2 {
-            return Err(Error::MissingEntrypointArgs);
-        }
-
-        println!("entrypoint: running {:?}", &args[1..]);
-        process::Command::new(sudo_path)
-            .args(sudo_args)
-            .arg("--")
-            .args(&args[1..])
-            .status()?;
-        Ok(())
-    }
-
     pub fn execute(&mut self) -> Result<()> {
         // note: since we want to use this binary as an entrypoint "script" in a docker container,
         // it has to be callable without using subcommands so the first thing we do is check if
@@ -209,7 +180,8 @@ impl ContainerManager {
         if binary == PathBuf::from("/entrypoint") {
             println!("wtf mate");
             let args = std::env::args().into_iter().map(String::from).collect();
-            return self.entrypoint(args);
+            let ep = entrypoint::Entrypoint::load();
+            return ep.execute(args);
         }
         self.execute_clap()
     }
@@ -240,6 +212,7 @@ impl ContainerManager {
             config = config.arg(arg);
         }
 
+        let mut ep = entrypoint::Entrypoint::empty();
         let cloned = dyn_clone::clone_box(&self.aspects);
         for aspect in cloned.iter() {
             for arg in aspect.config_args() {
@@ -251,6 +224,7 @@ impl ContainerManager {
             for arg in aspect.config_args() {
                 config = config.arg(arg);
             }
+            ep.extend(aspect.entrypoint_scripts());
         }
 
         app = app
@@ -273,7 +247,7 @@ impl ContainerManager {
             ("config", Some(subm)) => self.config(&subm),
             ("entrypoint", Some(subm)) => {
                 if let Some(args) = subm.values_of("command") {
-                    self.entrypoint(args.into_iter().map(String::from).collect())
+                    ep.execute(args.into_iter().map(String::from).collect())
                 } else {
                     Err(Error::MissingEntrypointArgs)
                 }
